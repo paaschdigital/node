@@ -21,6 +21,7 @@
 #include "src/base/optional.h"
 #include "src/base/platform/memory.h"
 #include "src/base/platform/mutex.h"
+#include "src/base/platform/time.h"
 #include "src/base/utils/random-number-generator.h"
 #include "src/builtins/accessors.h"
 #include "src/codegen/assembler-inl.h"
@@ -116,6 +117,7 @@
 #include "src/snapshot/snapshot.h"
 #include "src/strings/string-stream.h"
 #include "src/strings/unicode-inl.h"
+#include "src/tasks/cancelable-task.h"
 #include "src/tracing/trace-event.h"
 #include "src/utils/utils-inl.h"
 #include "src/utils/utils.h"
@@ -517,12 +519,12 @@ bool Heap::HasBeenSetUp() const {
 
 bool Heap::ShouldUseBackgroundThreads() const {
   return !v8_flags.single_threaded_gc_in_background ||
-         !isolate()->IsIsolateInBackground();
+         !isolate()->EfficiencyModeEnabled();
 }
 
 bool Heap::ShouldOptimizeForBattery() const {
   return v8_flags.optimize_gc_for_battery ||
-         isolate()->battery_saver_mode_enabled();
+         isolate()->BatterySaverModeEnabled();
 }
 
 GarbageCollector Heap::SelectGarbageCollector(AllocationSpace space,
@@ -1973,13 +1975,98 @@ void Heap::CollectGarbage(AllocationSpace space,
   }
 }
 
+class IdleTaskOnContextDispose : public CancelableIdleTask {
+ public:
+  static void TryPostJob(Heap* heap) {
+    const auto runner = heap->GetForegroundTaskRunner();
+    if (runner->IdleTasksEnabled()) {
+      runner->PostIdleTask(
+          std::make_unique<IdleTaskOnContextDispose>(heap->isolate()));
+    }
+  }
+
+  explicit IdleTaskOnContextDispose(Isolate* isolate)
+      : CancelableIdleTask(isolate), isolate_(isolate) {}
+
+  void RunInternal(double deadline_in_seconds) override {
+    auto* heap = isolate_->heap();
+    const base::TimeDelta time_to_run = base::TimeTicks::Now() - creation_time_;
+    // The provided delta uses embedder timestamps.
+    const base::TimeDelta idle_time = base::TimeDelta::FromMillisecondsD(
+        (deadline_in_seconds * 1000) - heap->MonotonicallyIncreasingTimeInMs());
+    const bool time_to_run_exceeded = time_to_run > kMaxTimeToRun;
+    if (V8_UNLIKELY(v8_flags.trace_context_disposal)) {
+      isolate_->PrintWithTimestamp(
+          "[context-disposal/idle task] time-to-run: %fms (max delay: %fms), "
+          "idle time: %fms%s\n",
+          time_to_run.InMillisecondsF(), kMaxTimeToRun.InMillisecondsF(),
+          idle_time.InMillisecondsF(),
+          time_to_run_exceeded ? ", not starting any action" : "");
+    }
+    if (time_to_run_exceeded) {
+      return;
+    }
+    TryRunMinorGC(idle_time);
+  }
+
+ private:
+  static constexpr base::TimeDelta kFrameTime =
+      base::TimeDelta::FromMillisecondsD(16);
+
+  // We limit any idle time actions here by a maximum time to run of a single
+  // frame. This avoids that these tasks are executed too late and causes
+  // (unpredictable) side effects with e.g. promotion of newly allocated
+  // objects.
+  static constexpr base::TimeDelta kMaxTimeToRun = kFrameTime + kFrameTime;
+
+  void TryRunMinorGC(const base::TimeDelta idle_time) {
+    // The following logic estimates whether a young generation GC would fit in
+    // `idle_time.` We bail out for a young gen below 1MB to avoid executing GC
+    // when the mutator is not actually active.
+    static constexpr size_t kMinYounGenSize = 1 * MB;
+
+    auto* heap = isolate_->heap();
+    const double young_gen_gc_speed =
+        heap->tracer()->YoungGenerationSpeedInBytesPerMillisecond(
+            YoungGenerationSpeedMode::kUpToAndIncludingAtomicPause);
+    const size_t young_gen_bytes = heap->YoungGenerationSizeOfObjects();
+    const base::TimeDelta young_gen_estimate =
+        base::TimeDelta::FromMillisecondsD(young_gen_bytes /
+                                           young_gen_gc_speed);
+    const bool run_young_gen_gc =
+        young_gen_estimate < idle_time && young_gen_bytes > kMinYounGenSize;
+    if (V8_UNLIKELY(v8_flags.trace_context_disposal)) {
+      isolate_->PrintWithTimestamp(
+          "[context-disposal/idle task] young generation size: %zuKB (min: "
+          "%zuKB), GC speed: %fKB/ms, estimated time: %fms%s\n",
+          young_gen_bytes / KB, kMinYounGenSize / KB, young_gen_gc_speed / KB,
+          young_gen_estimate.InMillisecondsF(),
+          run_young_gen_gc ? ", performing young gen GC"
+                           : ", not starting young gen GC");
+    }
+    if (run_young_gen_gc) {
+      heap->CollectGarbage(NEW_SPACE, GarbageCollectionReason::kTesting);
+    }
+  }
+
+  Isolate* isolate_;
+  const base::TimeTicks creation_time_ = base::TimeTicks::Now();
+};
+
 int Heap::NotifyContextDisposed(bool has_dependent_context) {
+  if (V8_UNLIKELY(v8_flags.trace_context_disposal)) {
+    isolate()->PrintWithTimestamp(
+        "[context-disposal] Disposing %s context\n",
+        has_dependent_context ? "nested" : "top-level");
+  }
   if (!has_dependent_context) {
     tracer()->ResetSurvivalEvents();
     ResetOldGenerationAndGlobalAllocationLimit();
     if (memory_reducer_) {
       memory_reducer_->NotifyPossibleGarbage();
     }
+  } else if (v8_flags.idle_gc_on_context_disposal) {
+    IdleTaskOnContextDispose::TryPostJob(this);
   }
   isolate()->AbortConcurrentOptimization(BlockingBehavior::kDontBlock);
   if (!isolate()->context().is_null()) {
@@ -1987,6 +2074,7 @@ int Heap::NotifyContextDisposed(bool has_dependent_context) {
     isolate()->raw_native_context()->set_retained_maps(
         ReadOnlyRoots(this).empty_weak_array_list());
   }
+
   return ++contexts_disposed_;
 }
 
@@ -2587,7 +2675,6 @@ void Heap::RecomputeLimits(GarbageCollector collector, base::TimeTicks time) {
       tracer()->CurrentOldGenerationAllocationThroughputInBytesPerMillisecond();
   double v8_growing_factor = MemoryController<V8HeapTrait>::GrowingFactor(
       this, max_old_generation_size(), v8_gc_speed, v8_mutator_speed);
-  double global_growing_factor = 0;
   double embedder_gc_speed = tracer()->EmbedderSpeedInBytesPerMillisecond();
   double embedder_speed =
       tracer()->CurrentEmbedderAllocationThroughputInBytesPerMillisecond();
@@ -2597,7 +2684,8 @@ void Heap::RecomputeLimits(GarbageCollector collector, base::TimeTicks time) {
                 this, max_global_memory_size_, embedder_gc_speed,
                 embedder_speed)
           : 0;
-  global_growing_factor = std::max(v8_growing_factor, embedder_growing_factor);
+  double global_growing_factor =
+      std::max(v8_growing_factor, embedder_growing_factor);
 
   size_t old_gen_size = OldGenerationSizeOfObjects();
   size_t new_space_capacity = NewSpaceTargetCapacity();
@@ -2687,8 +2775,6 @@ void Heap::MarkCompact() {
   SetGCState(MARK_COMPACT);
 
   PROFILE(isolate_, CodeMovingGCEvent());
-  CodePageHeaderModificationScope code_modification(
-      "MarkCompact needs to access the marking bitmap in the page header");
 
   UpdateOldGenerationAllocationCounter();
   uint64_t size_of_objects_before_gc = SizeOfObjects();
@@ -3687,6 +3773,32 @@ void Heap::UnmarkSharedLinearAllocationAreas() {
   });
 }
 
+void Heap::Unmark() {
+  DCHECK(v8_flags.sticky_mark_bits);
+  DCHECK_NULL(new_space());
+
+  auto unmark_space = [](auto& space) {
+    for (auto* page : space) {
+      page->marking_bitmap()->template Clear<AccessMode::NON_ATOMIC>();
+      page->SetLiveBytes(0);
+    }
+  };
+
+  unmark_space(*old_space());
+  unmark_space(*lo_space());
+
+  if (isolate()->is_shared_space_isolate()) {
+    unmark_space(*shared_space());
+    unmark_space(*shared_lo_space());
+  }
+
+  unmark_space(*code_space());
+  unmark_space(*code_lo_space());
+
+  unmark_space(*trusted_space());
+  unmark_space(*trusted_lo_space());
+}
+
 namespace {
 
 double ComputeMutatorUtilizationImpl(double mutator_speed, double gc_speed) {
@@ -3722,7 +3834,8 @@ bool Heap::HasLowYoungGenerationAllocationRate() {
   double mu = ComputeMutatorUtilization(
       "Young generation",
       tracer()->NewSpaceAllocationThroughputInBytesPerMillisecond(),
-      tracer()->ScavengeSpeedInBytesPerMillisecond(kForSurvivedObjects));
+      tracer()->YoungGenerationSpeedInBytesPerMillisecond(
+          YoungGenerationSpeedMode::kOnlyAtomicPause));
   constexpr double kHighMutatorUtilization = 0.993;
   return mu > kHighMutatorUtilization;
 }
@@ -3810,7 +3923,7 @@ bool Heap::HasHighFragmentation() {
 
 bool Heap::ShouldOptimizeForMemoryUsage() {
   const size_t kOldGenerationSlack = max_old_generation_size() / 8;
-  return v8_flags.optimize_for_size || isolate()->IsIsolateInBackground() ||
+  return v8_flags.optimize_for_size || isolate()->EfficiencyModeEnabled() ||
          HighMemoryPressure() || !CanExpandOldGeneration(kOldGenerationSlack);
 }
 
@@ -3847,7 +3960,7 @@ void Heap::ActivateMemoryReducerIfNeededOnMainThread() {
   // 2 pages for the old, code, and map space + 1 page for new space.
   const int kMinCommittedMemory = 7 * PageMetadata::kPageSize;
   if (ms_count_ == 0 && CommittedMemory() > kMinCommittedMemory &&
-      isolate()->IsIsolateInBackground()) {
+      isolate()->is_backgrounded()) {
     memory_reducer_->NotifyPossibleGarbage();
   }
 }
@@ -3944,7 +4057,7 @@ class ExternalPointerSlotInvalidator : public ObjectVisitor {
     DCHECK_EQ(target_, host);
     ExternalPointerTable::Space* space =
         IsolateForSandbox(isolate_).GetExternalPointerTableSpaceFor(
-            slot.tag(), slot.address());
+            slot.tag(), host.address());
     space->NotifyExternalPointerFieldInvalidated(slot.address());
     num_invalidated_slots++;
   }
@@ -4007,18 +4120,26 @@ void Heap::NotifyObjectLayoutChange(
     }
   }
 
-#ifdef V8_ENABLE_SANDBOX
   // During external pointer table compaction, the external pointer table
-  // records addresses of fields containing external pointers. As such, it
-  // needs to be informed when such a field is invalidated.
+  // records addresses of fields that index into the external pointer table. As
+  // such, it needs to be informed when such a field is invalidated.
   if (invalidate_external_pointer_slots ==
       InvalidateExternalPointerSlots::kYes) {
-    ExternalPointerSlotInvalidator external_pointer_slot_invalidator(isolate());
-    int num_invalidated_slots = external_pointer_slot_invalidator.Visit(object);
-    USE(num_invalidated_slots);
-    DCHECK_GT(num_invalidated_slots, 0);
-  }
+    // Currently, the only time this function receives
+    // InvalidateExternalPointerSlots::kYes is when an external string
+    // transitions to a thin string.  If this ever changed to happen for array
+    // buffer extension slots, we would have to run the invalidator in
+    // pointer-compression-but-no-sandbox configurations as well.
+    DCHECK(IsString(object));
+#ifdef V8_ENABLE_SANDBOX
+    if (V8_ENABLE_SANDBOX_BOOL) {
+      ExternalPointerSlotInvalidator slot_invalidator(isolate());
+      int num_invalidated_slots = slot_invalidator.Visit(object);
+      USE(num_invalidated_slots);
+      DCHECK_GT(num_invalidated_slots, 0);
+    }
 #endif
+  }
 
 #ifdef VERIFY_HEAP
   if (v8_flags.verify_heap) {
@@ -5494,7 +5615,7 @@ void Heap::SetUp(LocalHeap* main_thread_local_heap) {
   DCHECK_NOT_NULL(heap_allocator_);
 
   // Set the stack start for the main thread that sets up the heap.
-  SetStackStart(base::Stack::GetStackStart());
+  SetStackStart();
 
 #ifdef V8_ENABLE_ALLOCATION_TIMEOUT
   heap_allocator_->UpdateAllocationTimeout();
@@ -5986,11 +6107,11 @@ std::optional<StackState> Heap::overridden_stack_state() const {
   return embedder_stack_state_;
 }
 
-void Heap::SetStackStart(void* stack_start) {
+void Heap::SetStackStart() {
   // If no main thread local heap has been set up (we're still in the
   // deserialization process), we don't need to set the stack start.
   if (main_thread_local_heap_ == nullptr) return;
-  stack().SetStackStart(stack_start);
+  stack().SetStackStart();
 }
 
 ::heap::base::Stack& Heap::stack() {
@@ -6137,13 +6258,8 @@ void Heap::TearDown() {
 
   pretenuring_handler_.reset();
 
-  {
-    CodePageHeaderModificationScope rwx_write_scope(
-        "Deletion of CODE_SPACE and CODE_LO_SPACE requires write access to "
-        "Code page headers");
-    for (int i = FIRST_MUTABLE_SPACE; i <= LAST_MUTABLE_SPACE; i++) {
-      space_[i].reset();
-    }
+  for (int i = FIRST_MUTABLE_SPACE; i <= LAST_MUTABLE_SPACE; i++) {
+    space_[i].reset();
   }
 
   isolate()->read_only_heap()->OnHeapTearDown(this);
@@ -7470,12 +7586,7 @@ void Heap::EnsureSweepingCompleted(SweepingForcedFinalizationMode mode) {
                                    GCTracer::Scope::MC_COMPLETE_SWEEPING),
                                TRACE_EVENT_FLAG_FLOW_IN);
       old_space()->RefillFreeList();
-      {
-        CodePageHeaderModificationScope rwx_write_scope(
-            "Updating per-page stats stored in page headers requires write "
-            "access to Code page headers");
-        code_space()->RefillFreeList();
-      }
+      code_space()->RefillFreeList();
       if (shared_space()) {
         shared_space()->RefillFreeList();
       }
@@ -7560,7 +7671,8 @@ CppClassNamesAsHeapObjectNameScope::CppClassNamesAsHeapObjectNameScope(
 CppClassNamesAsHeapObjectNameScope::~CppClassNamesAsHeapObjectNameScope() =
     default;
 
-#if V8_HEAP_USE_PTHREAD_JIT_WRITE_PROTECT || V8_HEAP_USE_PKU_JIT_WRITE_PROTECT
+#if V8_HEAP_USE_PTHREAD_JIT_WRITE_PROTECT || \
+    V8_HEAP_USE_PKU_JIT_WRITE_PROTECT || V8_HEAP_USE_BECORE_JIT_WRITE_PROTECT
 
 CodePageMemoryModificationScopeForDebugging::
     CodePageMemoryModificationScopeForDebugging(Heap* heap,
@@ -7584,7 +7696,8 @@ CodePageMemoryModificationScopeForDebugging::
     ~CodePageMemoryModificationScopeForDebugging() {}
 
 #else  // V8_HEAP_USE_PTHREAD_JIT_WRITE_PROTECT ||
-       // V8_HEAP_USE_PKU_JIT_WRITE_PROTECT
+       // V8_HEAP_USE_PKU_JIT_WRITE_PROTECT ||
+       // V8_HEAP_USE_BECORE_JIT_WRITE_PROTECT
 
 CodePageMemoryModificationScopeForDebugging::
     CodePageMemoryModificationScopeForDebugging(Heap* heap,

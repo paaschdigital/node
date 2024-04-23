@@ -411,7 +411,7 @@ class WriteBarrierCodeStubAssembler : public CodeStubAssembler {
 
   void IncrementalWriteBarrierMinor(TNode<IntPtrT> slot, TNode<IntPtrT> value,
                                     SaveFPRegsMode fp_mode, Label* next) {
-    Label check_is_unmarked(this);
+    Label check_is_unmarked(this, Label::kDeferred);
 
     InYoungGeneration(value, &check_is_unmarked, next);
 
@@ -477,7 +477,8 @@ class WriteBarrierCodeStubAssembler : public CodeStubAssembler {
 
   void IncrementalWriteBarrier(TNode<IntPtrT> slot, SaveFPRegsMode fp_mode) {
     Label next(this), write_into_shared_object(this),
-        write_into_local_object(this), local_object_and_value(this);
+        write_into_local_object(this),
+        local_object_and_value(this, Label::kDeferred);
 
     TNode<IntPtrT> object = BitcastTaggedToWord(
         UncheckedParameter<Object>(WriteBarrierDescriptor::kObject));
@@ -1024,16 +1025,16 @@ class SetOrCopyDataPropertiesAssembler : public CodeStubAssembler {
         TNode<BoolT> target_is_simple_receiver = IsSimpleObjectMap(target_map);
         ForEachEnumerableOwnProperty(
             context, source_map, CAST(source), kEnumerationOrder,
-            [=](TNode<Name> key, TNode<Object> value) {
+            [=](TNode<Name> key, LazyNode<Object> value) {
               KeyedStoreGenericGenerator::SetProperty(
                   state(), context, target, target_is_simple_receiver, key,
-                  value, LanguageMode::kStrict);
+                  value(), LanguageMode::kStrict);
             },
             if_runtime);
       } else {
         ForEachEnumerableOwnProperty(
             context, source_map, CAST(source), kEnumerationOrder,
-            [=](TNode<Name> key, TNode<Object> value) {
+            [=](TNode<Name> key, LazyNode<Object> value) {
               Label skip(this);
               if (excluded_property_count.has_value()) {
                 BuildFastLoop<IntPtrT>(
@@ -1052,7 +1053,7 @@ class SetOrCopyDataPropertiesAssembler : public CodeStubAssembler {
               }
 
               CallBuiltin(Builtin::kCreateDataProperty, context, target, key,
-                          value);
+                          value());
               Goto(&skip);
               Bind(&skip);
             },

@@ -818,7 +818,7 @@ struct MemoryAccessImmediate {
 
   template <typename ValidationTag>
   V8_INLINE MemoryAccessImmediate(Decoder* decoder, const uint8_t* pc,
-                                  uint32_t max_alignment, bool is_memory64,
+                                  uint32_t max_alignment, bool memory64_enabled,
                                   bool multi_memory_enabled,
                                   ValidationTag = {}) {
     // Check for the fast path (two single-byte LEBs, mem index 0).
@@ -830,7 +830,7 @@ struct MemoryAccessImmediate {
       offset = pc[1];
       length = 2;
     } else {
-      ConstructSlow<ValidationTag>(decoder, pc, max_alignment, is_memory64,
+      ConstructSlow<ValidationTag>(decoder, pc, max_alignment, memory64_enabled,
                                    multi_memory_enabled);
     }
     if (!VALIDATE(alignment <= max_alignment)) {
@@ -847,7 +847,7 @@ struct MemoryAccessImmediate {
   V8_NOINLINE V8_PRESERVE_MOST void ConstructSlow(Decoder* decoder,
                                                   const uint8_t* pc,
                                                   uint32_t max_alignment,
-                                                  bool is_memory64,
+                                                  bool memory64_enabled,
                                                   bool multi_memory_enabled) {
     uint32_t alignment_length;
     std::tie(alignment, alignment_length) =
@@ -863,7 +863,7 @@ struct MemoryAccessImmediate {
       mem_index = 0;
     }
     uint32_t offset_length;
-    if (is_memory64) {
+    if (memory64_enabled) {
       std::tie(offset, offset_length) =
           decoder->read_u64v<ValidationTag>(pc + length, "offset");
     } else {
@@ -1738,6 +1738,10 @@ class WasmDecoder : public Decoder {
       DecodeError(pc, "function index #%u is out of bounds", imm.index);
       return false;
     }
+    if (is_shared_ && !module_->function_is_shared(imm.index)) {
+      DecodeError(pc, "cannot call non-shared function %u", imm.index);
+      return false;
+    }
     V8_ASSUME(imm.index < num_functions);
     imm.sig = module_->functions[imm.index].sig;
     return true;
@@ -1749,7 +1753,10 @@ class WasmDecoder : public Decoder {
       return false;
     }
     ValueType table_type = module_->tables[imm.table_imm.index].type;
-    if (!VALIDATE(IsSubtypeOf(table_type, kWasmFuncRef, module_))) {
+    if (!VALIDATE(IsSubtypeOf(table_type, kWasmFuncRef, module_) ||
+                  IsSubtypeOf(table_type,
+                              ValueType::RefNull(HeapType::kFuncShared),
+                              module_))) {
       DecodeError(
           pc, "call_indirect: immediate table #%u is not of a function type",
           imm.table_imm.index);
@@ -3301,7 +3308,7 @@ class WasmFullDecoder : public WasmDecoder<ValidationTag, decoding_mode> {
       ++i;
     }
     CALL_INTERFACE_IF_OK_AND_REACHABLE(TryTable, try_block);
-    return 2 + try_table_iterator.length();
+    return 1 + block_imm.length + try_table_iterator.length();
   }
 
   DECODE(ThrowRef) {
@@ -4659,7 +4666,8 @@ class WasmFullDecoder : public WasmDecoder<ValidationTag, decoding_mode> {
            ((!null_succeeds || !obj.type.is_nullable()) &&
             (expected_type.representation() == HeapType::kNone ||
              expected_type.representation() == HeapType::kNoFunc ||
-             expected_type.representation() == HeapType::kNoExtern));
+             expected_type.representation() == HeapType::kNoExtern ||
+             expected_type.representation() == HeapType::kNoExn));
   }
   bool TypeCheckAlwaysFails(Value obj, uint32_t ref_index) {
     // All old casts / checks treat null as failure.
@@ -6171,6 +6179,11 @@ class WasmFullDecoder : public WasmDecoder<ValidationTag, decoding_mode> {
       DCHECK(!current_code_reachable_and_ok_);
       return array;
     }
+    // Inputs of type "none" are okay due to implicit upcasting. The stringref
+    // spec doesn't say this explicitly yet, but it's consistent with the rest
+    // of Wasm. (Of course such inputs will trap at runtime.) See:
+    // https://github.com/WebAssembly/stringref/issues/66
+    if (array.type.is_reference_to(HeapType::kNone)) return array;
     if (VALIDATE(array.type.is_object_reference() && array.type.has_index())) {
       uint32_t ref_index = array.type.ref_index();
       if (VALIDATE(this->module_->has_array(ref_index))) {
